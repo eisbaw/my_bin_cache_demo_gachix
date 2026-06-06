@@ -39,11 +39,16 @@ git clone --mirror https://github.com/eisbaw/my_bin_cache_demo_gachix.git cache
 #    config.yaml: store.path: ./cache, use_local_nix_daemon: false
 gachix -c config.yaml serve            # listens on http://localhost:8080
 
-# 3. Tell nix to use it as a substituter.
+# 3. Tell nix to use it as a substituter. The cache is signed, so trust its key.
 nix build .#hello-html \
-  --substituters http://localhost:8080 \
-  --option require-sigs false
+  --substituters http://127.0.0.1:8080 \
+  --option extra-trusted-public-keys \
+    "my-bin-cache-demo-gachix-1:kcxihECOFVeKOVHp+yUU5uoaq4OaIgr6gDCqHHX6hw4="
 ```
+
+> Use `127.0.0.1`, not `localhost` (Docker's published port is IPv4-only).
+> A GitHub Actions workflow (`.github/workflows/use-gachix-cache.yml`) runs this
+> whole flow on every push, with Determinate Nix configured to use the cache.
 
 ## Status
 

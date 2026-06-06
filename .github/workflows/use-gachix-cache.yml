@@ -47,7 +47,7 @@ jobs:
           extra-conf: |
             extra-substituters = http://127.0.0.1:8080
             extra-trusted-substituters = http://127.0.0.1:8080
-            require-sigs = false
+            extra-trusted-public-keys = my-bin-cache-demo-gachix-1:kcxihECOFVeKOVHp+yUU5uoaq4OaIgr6gDCqHHX6hw4=
 
       - name: Realise hello-html from the cache only (no local build)
         run: |
