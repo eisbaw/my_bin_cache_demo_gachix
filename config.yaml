@@ -1,0 +1,13 @@
+log_level: info
+store:
+  # A mirror-clone of this repo:  git clone --mirror <repo-url> cache
+  path: ./cache
+  builders: []
+  remotes: []
+  # false: serve-only on a machine without Nix.
+  # Set true (and point path at this repo) only when ingesting with `gachix add`.
+  use_local_nix_daemon: false
+
+server:
+  host: localhost
+  port: 8080
