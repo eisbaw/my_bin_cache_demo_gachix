@@ -1,42 +1,43 @@
-name: Use gachix cache
+name: Build + populate gachix cache
 
-# Demonstrates consuming THIS repo as a Nix binary cache:
-#   1. mirror-clone the repo (its refs/<hash>/* ARE the cache)
-#   2. run the gachix proxy (Docker) to bridge git objects -> HTTP cache protocol
-#   3. configure Determinate Nix to use http://127.0.0.1:8080 as a substituter
-#   4. realise the package with --max-jobs 0, so it MUST come from the cache (no local build)
+# Read-write (pull-through) cache demo:
+#   - mirror-clone this repo (its refs/<hash>/* ARE the cache)
+#   - run the gachix proxy (Docker) so nix can substitute over HTTP
+#   - build hello-html: substituted on a cache hit, built locally on a miss
+#   - on a miss, sign + `gachix add` the built path and git-push it back here,
+#     so the next run is a cache hit and never rebuilds it again.
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write   # push refs/<hash>/* back into this repo
+
 jobs:
-  consume-cache:
+  build-and-cache:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The custom refs/<hash>/* namespaces only come along with --mirror,
-      # not a normal clone.
       - name: Mirror-clone the cache
-        run: git clone --mirror "https://github.com/${{ github.repository }}.git" cache
-
-      - name: Start gachix proxy (serves the git-backed cache over HTTP)
         run: |
-          # The container runs as root; libgit2 refuses to open a repo not owned
-          # by the current user. Hand the clone to root so gachix can open it.
-          sudo chown -R 0:0 cache
+          git clone --mirror "https://github.com/${{ github.repository }}.git" cache
+          git -C cache config --unset remote.origin.mirror || true   # avoid mirror-delete on push
+          sudo chown -R 0:0 cache                                     # container (root) must own the repo
+
+      - name: Start gachix proxy
+        run: |
           docker run -d --name gachix -p 8080:8080 \
             -v "$PWD/cache:/cache" \
             -e GACHIX__STORE__PATH=/cache \
             -e GACHIX__SERVER__HOST=0.0.0.0 \
             -e GACHIX__SERVER__PORT=8080 \
             ephraimsiegfried/gachix:latest
-          # Wait until it answers. NB: use 127.0.0.1, not localhost — Docker's
-          # published port is IPv4-only and localhost may resolve to ::1.
+          # 127.0.0.1, not localhost: Docker's published port is IPv4-only.
           for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:8080/nix-cache-info; then echo "gachix up"; exit 0; fi
+            curl -sf http://127.0.0.1:8080/nix-cache-info && exit 0
             sleep 1
           done
           echo "gachix did not become ready"; docker logs gachix; exit 1
@@ -47,18 +48,51 @@ jobs:
           extra-conf: |
             extra-substituters = http://127.0.0.1:8080
             extra-trusted-substituters = http://127.0.0.1:8080
-            extra-trusted-public-keys = my-bin-cache-demo-gachix-1:kcxihECOFVeKOVHp+yUU5uoaq4OaIgr6gDCqHHX6hw4=
+            extra-trusted-public-keys = gachix-ci-1:yZUPdH0jbeU23e/qXD+VARO8tGUumOXiuhPfwGq3Uzg=
 
-      - name: Realise hello-html from the cache only (no local build)
+      - name: Build hello-html (substitute on hit, build on miss)
+        id: build
         run: |
-          # --max-jobs 0 forbids local building, so success proves the output
-          # was substituted from the gachix cache.
-          out=$(nix build .#hello-html --max-jobs 0 -L --no-link --print-out-paths)
-          echo "Substituted store path: $out"
-          echo "--- hello.html ---"
-          cat "$out/hello.html"
-          grep -q "Hello, world!" "$out/hello.html" && echo "PASS: served from gachix cache"
+          out=$(nix eval --raw .#hello-html)
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+          hash=$(basename "$out" | cut -d- -f1)
+          if curl -sf "http://127.0.0.1:8080/$hash.narinfo" -o /dev/null; then
+            echo "Pre-check: CACHE HIT for $out"
+          else
+            echo "Pre-check: CACHE MISS for $out (will build locally, then push back)"
+          fi
+          nix build .#hello-html -L --no-link --print-out-paths 2> build.log
+          if grep -q "from 'http://127.0.0.1:8080'" build.log; then
+            echo "RESULT: substituted from gachix cache (no rebuild)"
+          elif grep -q "building '" build.log; then
+            echo "RESULT: built locally (cache miss)"
+          fi
+          sed -n '1,40p' build.log
+          echo "--- hello.html ---"; cat "$out/hello.html"
 
-      - name: Show gachix access log (proof it served narinfo + nar)
+      - name: Push built path back into the cache (sign + add + git push)
+        run: |
+          printf '%s' "${{ secrets.GACHIX_SIGNING_KEY }}" > /tmp/cache.secret
+          chmod 600 /tmp/cache.secret
+          # gachix add ingests via the runner's Nix daemon (mounted socket) and signs.
+          docker run --rm \
+            -v "$PWD/cache:/cache" \
+            -v /nix/var/nix/daemon-socket/socket:/nix/var/nix/daemon-socket/socket \
+            -v /tmp/cache.secret:/cache.secret:ro \
+            -e GACHIX__STORE__PATH=/cache \
+            -e GACHIX__STORE__USE_LOCAL_NIX_DAEMON=true \
+            -e GACHIX__STORE__SIGN_PRIVATE_KEY_PATH=/cache.secret \
+            --entrypoint gachix \
+            ephraimsiegfried/gachix:latest add "${{ steps.build.outputs.out }}"
+          rm -f /tmp/cache.secret
+          # Hand the repo back to the runner user and push the cache refs.
+          sudo chown -R "$(id -u):$(id -g)" cache
+          git -C cache remote set-url origin \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git -C cache push origin \
+            '+refs/*/narinfo:refs/*/narinfo' \
+            '+refs/*/result:refs/*/result'
+
+      - name: gachix access log
         if: always()
-        run: docker logs gachix 2>&1 | grep -Ei 'narinfo|\.nar|GET' || docker logs gachix
+        run: docker logs gachix 2>&1 | tail -20

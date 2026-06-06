@@ -43,7 +43,7 @@ gachix -c config.yaml serve            # listens on http://localhost:8080
 nix build .#hello-html \
   --substituters http://127.0.0.1:8080 \
   --option extra-trusted-public-keys \
-    "my-bin-cache-demo-gachix-1:kcxihECOFVeKOVHp+yUU5uoaq4OaIgr6gDCqHHX6hw4="
+    "gachix-ci-1:yZUPdH0jbeU23e/qXD+VARO8tGUumOXiuhPfwGq3Uzg="
 ```
 
 > Use `127.0.0.1`, not `localhost` (Docker's published port is IPv4-only).
