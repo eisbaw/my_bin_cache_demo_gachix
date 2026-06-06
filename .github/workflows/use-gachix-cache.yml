@@ -24,6 +24,9 @@ jobs:
 
       - name: Start gachix proxy (serves the git-backed cache over HTTP)
         run: |
+          # The container runs as root; libgit2 refuses to open a repo not owned
+          # by the current user. Hand the clone to root so gachix can open it.
+          sudo chown -R 0:0 cache
           docker run -d --name gachix -p 8080:8080 \
             -v "$PWD/cache:/cache" \
             -e GACHIX__STORE__PATH=/cache \
