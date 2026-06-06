@@ -1,11 +1,14 @@
-name: Build + populate gachix cache
+name: Build + populate gachix cache (sharded, partial, persisted)
 
-# Read-write (pull-through) cache demo:
-#   - mirror-clone this repo (its refs/<hash>/* ARE the cache)
-#   - run the gachix proxy (Docker) so nix can substitute over HTTP
-#   - build hello-html: substituted on a cache hit, built locally on a miss
-#   - on a miss, sign + `gachix add` the built path and git-push it back here,
-#     so the next run is a cache hit and never rebuilds it again.
+# Read-write pull-through cache over the SHARDED layout (refs/heads/gachix/<shard>/<hash>):
+#   - persist a BARE cache repo across runs (actions/cache) and fetch ONLY the gachix
+#     package branches as full objects (a branch fetch pulls its whole closure via parent
+#     commits) — namespace-scoped, never a mirror clone, never --filter (libgit2 can't
+#     lazy-fetch missing objects, so partial/blobless clones would break serving).
+#   - run the forked gachix proxy (ghcr.io/eisbaw/gachix) so nix can substitute over HTTP.
+#   - build hello-html: substituted on a cache hit, built locally on a miss.
+#   - on a miss, sign + `gachix add` the built path and push refs/heads/gachix/* back, so
+#     the next run is a cache hit and never rebuilds it.
 
 on:
   push:
@@ -13,7 +16,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # push refs/<hash>/* back into this repo
+  contents: write   # push refs/heads/gachix/* back into this repo
 
 jobs:
   build-and-cache:
@@ -21,20 +24,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Mirror-clone the cache
-        run: |
-          git clone --mirror "https://github.com/${{ github.repository }}.git" cache
-          git -C cache config --unset remote.origin.mirror || true   # avoid mirror-delete on push
-          sudo chown -R 0:0 cache                                     # container (root) must own the repo
+      - name: Restore persisted bare cache repo
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: gachix-cache-${{ github.run_id }}   # rolling key: always writes a fresh entry
+          restore-keys: gachix-cache-              # restores the most recent prior entry
 
-      - name: Start gachix proxy
+      - name: Prepare bare cache repo (namespace-scoped fetch, full objects)
+        run: |
+          if [ ! -d cache ]; then git init --bare cache; fi
+          git -C cache config protocol.version 2
+          git -C cache remote add origin "https://github.com/${{ github.repository }}.git" 2>/dev/null \
+            || git -C cache remote set-url origin "https://github.com/${{ github.repository }}.git"
+          # Fetch ONLY gachix package branches, full objects, into native refs/heads/* so
+          # gachix (which looks up refs/heads/gachix/...) can serve them. First ever run:
+          # the remote may have none yet -> no-op.
+          git -C cache fetch --prune --no-tags origin \
+            '+refs/heads/gachix/*:refs/heads/gachix/*' || true
+          echo "cache branches: $(git -C cache for-each-ref --format='%(refname)' 'refs/heads/gachix/*' | wc -l)"
+          sudo chown -R 0:0 cache    # container (root) must own the repo for libgit2
+
+      - name: Start gachix proxy (forked image from GHCR)
         run: |
           docker run -d --name gachix -p 8080:8080 \
             -v "$PWD/cache:/cache" \
             -e GACHIX__STORE__PATH=/cache \
             -e GACHIX__SERVER__HOST=0.0.0.0 \
             -e GACHIX__SERVER__PORT=8080 \
-            ephraimsiegfried/gachix:latest
+            ghcr.io/eisbaw/gachix:latest
           # 127.0.0.1, not localhost: Docker's published port is IPv4-only.
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8080/nix-cache-info && exit 0
@@ -70,8 +88,10 @@ jobs:
           sed -n '1,40p' build.log
           echo "--- hello.html ---"; cat "$out/hello.html"
 
-      - name: Push built path back into the cache (sign + add + git push)
+      - name: Push built path back into the cache (sign + add + push gachix branches)
         run: |
+          # Cleanup the private key on ANY exit (including a failed `gachix add`).
+          trap 'rm -f /tmp/cache.secret' EXIT
           printf '%s' "${{ secrets.GACHIX_SIGNING_KEY }}" > /tmp/cache.secret
           chmod 600 /tmp/cache.secret
           # gachix add ingests via the runner's Nix daemon (mounted socket) and signs.
@@ -83,15 +103,15 @@ jobs:
             -e GACHIX__STORE__USE_LOCAL_NIX_DAEMON=true \
             -e GACHIX__STORE__SIGN_PRIVATE_KEY_PATH=/cache.secret \
             --entrypoint gachix \
-            ephraimsiegfried/gachix:latest add "${{ steps.build.outputs.out }}"
-          rm -f /tmp/cache.secret
-          # Hand the repo back to the runner user and push the cache refs.
+            ghcr.io/eisbaw/gachix:latest add "${{ steps.build.outputs.out }}"
+          # Hand the repo back to the runner user and push the gachix branches.
+          # Push to a one-off tokenized URL passed as an argument — NEVER written to
+          # cache/config (origin stays tokenless), so the persisted actions/cache that
+          # archives `cache/` cannot leak the token.
           sudo chown -R "$(id -u):$(id -g)" cache
-          git -C cache remote set-url origin \
-            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git -C cache push origin \
-            '+refs/*/narinfo:refs/*/narinfo' \
-            '+refs/*/result:refs/*/result'
+          git -C cache push \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            '+refs/heads/gachix/*:refs/heads/gachix/*'
 
       - name: gachix access log
         if: always()

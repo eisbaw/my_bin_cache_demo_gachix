@@ -1,0 +1,3 @@
+[submodule "gachix"]
+	path = gachix
+	url = https://github.com/eisbaw/gachix.git
