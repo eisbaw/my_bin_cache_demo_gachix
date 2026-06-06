@@ -1,0 +1,61 @@
+name: Use gachix cache
+
+# Demonstrates consuming THIS repo as a Nix binary cache:
+#   1. mirror-clone the repo (its refs/<hash>/* ARE the cache)
+#   2. run the gachix proxy (Docker) to bridge git objects -> HTTP cache protocol
+#   3. configure Determinate Nix to use http://127.0.0.1:8080 as a substituter
+#   4. realise the package with --max-jobs 0, so it MUST come from the cache (no local build)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  consume-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The custom refs/<hash>/* namespaces only come along with --mirror,
+      # not a normal clone.
+      - name: Mirror-clone the cache
+        run: git clone --mirror "https://github.com/${{ github.repository }}.git" cache
+
+      - name: Start gachix proxy (serves the git-backed cache over HTTP)
+        run: |
+          docker run -d --name gachix -p 8080:8080 \
+            -v "$PWD/cache:/cache" \
+            -e GACHIX__STORE__PATH=/cache \
+            -e GACHIX__SERVER__HOST=0.0.0.0 \
+            -e GACHIX__SERVER__PORT=8080 \
+            ephraimsiegfried/gachix:latest
+          # Wait until it answers. NB: use 127.0.0.1, not localhost — Docker's
+          # published port is IPv4-only and localhost may resolve to ::1.
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/nix-cache-info; then echo "gachix up"; exit 0; fi
+            sleep 1
+          done
+          echo "gachix did not become ready"; docker logs gachix; exit 1
+
+      - name: Install Determinate Nix, configured to use the gachix cache
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            extra-substituters = http://127.0.0.1:8080
+            extra-trusted-substituters = http://127.0.0.1:8080
+            require-sigs = false
+
+      - name: Realise hello-html from the cache only (no local build)
+        run: |
+          # --max-jobs 0 forbids local building, so success proves the output
+          # was substituted from the gachix cache.
+          out=$(nix build .#hello-html --max-jobs 0 -L --no-link --print-out-paths)
+          echo "Substituted store path: $out"
+          echo "--- hello.html ---"
+          cat "$out/hello.html"
+          grep -q "Hello, world!" "$out/hello.html" && echo "PASS: served from gachix cache"
+
+      - name: Show gachix access log (proof it served narinfo + nar)
+        if: always()
+        run: docker logs gachix 2>&1 | grep -Ei 'narinfo|\.nar|GET' || docker logs gachix
