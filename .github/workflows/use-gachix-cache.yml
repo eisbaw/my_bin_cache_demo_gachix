@@ -42,7 +42,11 @@ jobs:
           # the remote may have none yet -> no-op.
           git -C cache fetch --prune --no-tags origin \
             '+refs/heads/gachix/*:refs/heads/gachix/*' || true
-          echo "cache branches: $(git -C cache for-each-ref --format='%(refname)' 'refs/heads/gachix/*' | wc -l)"
+          # NB: use the prefix form, not 'refs/heads/gachix/*' — git for-each-ref is
+          # pathname-aware (* does not cross /), so the glob would miss the two-level
+          # <shard>/<hash> refs even though the fetch/push refspecs and gachix's libgit2
+          # glob match them correctly.
+          echo "cache branches: $(git -C cache for-each-ref --format='%(refname)' 'refs/heads/gachix/' | wc -l)"
           sudo chown -R 0:0 cache    # container (root) must own the repo for libgit2
 
       - name: Start gachix proxy (forked image from GHCR)
